@@ -22,6 +22,12 @@ public class SwipeFootballShooter : MonoBehaviour,
     [SerializeField] private BoxCollider aimBoundary;
     [SerializeField] private Transform ballSpawnPoint;
 
+    [Header("Mobile Performance")]
+    [Tooltip("Requested frame rate on mobile. Use 60 for most devices; use 30 for low-end devices.")]
+    [SerializeField, Range(30, 120)] private int targetFrameRate = 60;
+    [Tooltip("Enable Rigidbody interpolation for smoother rendered ball movement.")]
+    [SerializeField] private bool enableRigidbodyInterpolation = true;
+
     [Header("Swipe")]
     [SerializeField, Min(1f)] private float minSwipePixels = 20f;
     [SerializeField, Min(2f)] private float maxSwipePixels = 600f;
@@ -42,9 +48,21 @@ public class SwipeFootballShooter : MonoBehaviour,
     [SerializeField, Min(0.1f)] private float maxFlightTime = 5f;
 
     [Header("Trajectory")]
-    [SerializeField, Range(2, 100)] private int trajectoryPoints = 40;
-    [SerializeField, Min(0.005f)] private float trajectoryTimeStep = 0.04f;
-    [SerializeField, Min(0.001f)] private float previewSmoothTime = 0.04f;
+    [SerializeField, Range(2, 150)] private int trajectoryPoints = 80;
+    [SerializeField, Min(0.005f)] private float trajectoryTimeStep = 0.02f;
+    [SerializeField, Min(0.001f)] private float previewSmoothTime = 0.025f;
+
+    [Header("Landing Marker")]
+    [Tooltip("A second Line Renderer used only for the circular landing marker.")]
+    [SerializeField] private LineRenderer landingCircle;
+    [Tooltip("Assign the football field collider. This is more reliable than using a general raycast.")]
+    [SerializeField] private Collider groundCollider;
+    [Tooltip("Used only when Ground Collider is not assigned. Put the field on this layer.")]
+    [SerializeField] private LayerMask groundLayer = ~0;
+    [SerializeField, Min(0.05f)] private float landingCircleRadius = 0.5f;
+    [SerializeField, Range(16, 128)] private int landingCircleSegments = 64;
+    [SerializeField, Min(0.001f)] private float landingCircleWidth = 0.04f;
+    [SerializeField, Min(0f)] private float landingCircleOffset = 0.025f;
 
     [Header("Respawn")]
     [SerializeField, Min(0f)] private float respawnDelay = 1f;
@@ -59,6 +77,9 @@ public class SwipeFootballShooter : MonoBehaviour,
     private Vector2 previousSwipePosition;
     private float previousSwipeTime;
     private float currentSwipeSpeed;
+    // Highest speed reached during this swipe. Do not let stationary drag
+    // callbacks reduce aim power while the player is holding their finger.
+    private float peakSwipeSpeed;
 
     private Vector3 launchVelocity;
     private Vector3 smoothedLaunchVelocity;
@@ -72,9 +93,14 @@ public class SwipeFootballShooter : MonoBehaviour,
     private bool hasShot;
     private bool isRespawning;
     private Coroutine respawnCoroutine;
+    private readonly RaycastHit[] groundHitBuffer = new RaycastHit[8];
 
     private void Awake()
     {
+        // Request a stable mobile render rate. On mobile, vSyncCount is generally ignored.
+        Application.targetFrameRate = targetFrameRate;
+        QualitySettings.vSyncCount = 0;
+
         // Resolve references BEFORE reading Rigidbody values. This avoids the
         // null-reference error in the previous version when ballRb was unassigned.
         if (ballRb == null)
@@ -97,13 +123,28 @@ public class SwipeFootballShooter : MonoBehaviour,
 
         ballRb.isKinematic = true;
         ballRb.useGravity = true;
-        ballRb.interpolation = RigidbodyInterpolation.Interpolate;
+        ballRb.interpolation = enableRigidbodyInterpolation
+            ? RigidbodyInterpolation.Interpolate
+            : RigidbodyInterpolation.None;
+        ballRb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+        ballRb.maxAngularVelocity = 20f;
 
         if (trajectoryLine != null)
         {
             trajectoryLine.useWorldSpace = true;
             trajectoryLine.positionCount = 0;
+            trajectoryLine.numCornerVertices = 2;
+            trajectoryLine.numCapVertices = 2;
             trajectoryLine.enabled = false;
+        }
+
+        if (landingCircle != null)
+        {
+            landingCircle.useWorldSpace = true;
+            landingCircle.loop = true;
+            landingCircle.positionCount = 0;
+            landingCircle.widthMultiplier = landingCircleWidth;
+            landingCircle.enabled = false;
         }
 
         aimPoint = ballRb.position;
@@ -114,13 +155,32 @@ public class SwipeFootballShooter : MonoBehaviour,
         if (!isSwiping || hasShot || isRespawning)
             return;
 
+        // Frame-rate-independent smoothing. The same smoothed velocity drives
+        // both the arc and landing marker, preventing them from drifting apart.
         smoothedLaunchVelocity = Vector3.SmoothDamp(
             smoothedLaunchVelocity,
             launchVelocity,
             ref previewVelocity,
-            previewSmoothTime);
+            previewSmoothTime,
+            Mathf.Infinity,
+            Time.unscaledDeltaTime);
 
-        DrawTrajectory(smoothedLaunchVelocity);
+        if (TryCalculateLanding(
+                smoothedLaunchVelocity,
+                out Vector3 landingPoint,
+                out float landingTime,
+                out Vector3 groundNormal))
+        {
+            DrawTrajectory(smoothedLaunchVelocity, landingPoint, landingTime);
+            DrawLandingCircle(landingPoint, groundNormal);
+        }
+        else
+        {
+            if (trajectoryLine != null)
+                trajectoryLine.positionCount = 0;
+
+            HideLandingCircle();
+        }
     }
 
     public void OnPointerDown(PointerEventData eventData)
@@ -134,6 +194,7 @@ public class SwipeFootballShooter : MonoBehaviour,
         previousSwipePosition = swipeStart;
         previousSwipeTime = Time.unscaledTime;
         currentSwipeSpeed = 0f;
+        peakSwipeSpeed = 0f;
 
         launchVelocity = Vector3.zero;
         smoothedLaunchVelocity = Vector3.zero;
@@ -186,7 +247,14 @@ public class SwipeFootballShooter : MonoBehaviour,
         {
             float distance = Vector2.Distance(position, previousSwipePosition);
             float instantSpeed = distance / deltaTime;
-            currentSwipeSpeed = Mathf.Lerp(currentSwipeSpeed, instantSpeed, 0.35f);
+            // Exponential smoothing behaves consistently at different frame rates.
+            float speedBlend = 1f - Mathf.Exp(-18f * deltaTime);
+            currentSwipeSpeed = Mathf.Lerp(currentSwipeSpeed, instantSpeed, speedBlend);
+
+            // Record the maximum speed reached during this gesture.
+            // When the finger stops moving, currentSwipeSpeed naturally falls
+            // toward zero, but peakSwipeSpeed remains unchanged.
+            peakSwipeSpeed = Mathf.Max(peakSwipeSpeed, currentSwipeSpeed);
         }
 
         previousSwipePosition = position;
@@ -230,8 +298,14 @@ public class SwipeFootballShooter : MonoBehaviour,
         float distancePower = Mathf.InverseLerp(minSwipePixels, maxSwipePixels, adjustedDistance);
         distancePower = Mathf.Pow(Mathf.Clamp01(distancePower), aimPowerExponent);
 
-        float speedPower = Mathf.InverseLerp(minSwipeSpeed, maxSwipeSpeed, currentSwipeSpeed);
-        float power = Mathf.Lerp(distancePower, Mathf.Max(distancePower, speedPower), swipeSpeedInfluence);
+        // Use peak speed, not the current speed. EventSystem can continue
+        // sending OnDrag while the finger is stationary; current speed then
+        // becomes zero and previously caused the aim/landing point to move back.
+        float speedPower = Mathf.InverseLerp(minSwipeSpeed, maxSwipeSpeed, peakSwipeSpeed);
+        float power = Mathf.Lerp(
+            distancePower,
+            Mathf.Max(distancePower, speedPower),
+            swipeSpeedInfluence);
 
         float availableDistance = GetMaxDistanceInsideBoundary(worldDirection);
         if (availableDistance <= 0.01f)
@@ -322,33 +396,235 @@ public class SwipeFootballShooter : MonoBehaviour,
         return world;
     }
 
-    private void DrawTrajectory(Vector3 velocity)
+    /// <summary>
+    /// Predicts where the ball centre first reaches the field surface.
+    /// The returned landingPoint is on the field surface (not floating at ball-centre height).
+    /// </summary>
+    private bool TryCalculateLanding(
+        Vector3 velocity,
+        out Vector3 landingPoint,
+        out float landingTime,
+        out Vector3 groundNormal)
+    {
+        landingPoint = ballRb.position;
+        landingTime = 0f;
+        groundNormal = Vector3.up;
+
+        if (velocity.sqrMagnitude < 0.001f || Physics.gravity.y >= -0.001f)
+            return false;
+
+        // Find the field directly below the ball. If Ground Collider is assigned,
+        // this ray tests only that collider and cannot accidentally hit the football.
+        Vector3 rayOrigin = ballRb.position + Vector3.up * 20f;
+        Ray downRay = new Ray(rayOrigin, Vector3.down);
+
+        if (!TryGetGroundHit(downRay, 40f, out RaycastHit startGroundHit))
+            return false;
+
+        groundNormal = startGroundHit.normal;
+
+        // Approximate the football centre height at first ground contact.
+        float ballRadius = GetApproximateBallRadius();
+        float targetCenterY = startGroundHit.point.y + ballRadius;
+
+        // Solve: startY + vy*t + 0.5*gy*t^2 = targetCenterY.
+        float a = 0.5f * Physics.gravity.y;
+        float b = velocity.y;
+        float c = ballRb.position.y - targetCenterY;
+        float discriminant = b * b - 4f * a * c;
+
+        if (discriminant < 0f)
+            return false;
+
+        float sqrtD = Mathf.Sqrt(discriminant);
+        float t1 = (-b - sqrtD) / (2f * a);
+        float t2 = (-b + sqrtD) / (2f * a);
+
+        // Choose the positive descending intersection.
+        float candidate = Mathf.Max(t1, t2);
+        if (candidate <= 0f)
+            candidate = Mathf.Min(t1, t2);
+
+        if (candidate <= 0f || float.IsNaN(candidate) || float.IsInfinity(candidate))
+            return false;
+
+        landingTime = Mathf.Min(candidate, maxFlightTime);
+
+        Vector3 predictedCenter = ballRb.position
+            + velocity * landingTime
+            + 0.5f * Physics.gravity * landingTime * landingTime;
+
+        // Cast down at the predicted X/Z to place the ring on the actual field surface.
+        Vector3 landingRayOrigin = new Vector3(
+            predictedCenter.x,
+            Mathf.Max(predictedCenter.y, startGroundHit.point.y) + 20f,
+            predictedCenter.z);
+
+        if (TryGetGroundHit(new Ray(landingRayOrigin, Vector3.down), 40f,
+                out RaycastHit landingHit))
+        {
+            landingPoint = landingHit.point + landingHit.normal * landingCircleOffset;
+            groundNormal = landingHit.normal;
+        }
+        else
+        {
+            // Flat-field fallback: retain the predicted X/Z and known field height.
+            landingPoint = new Vector3(
+                predictedCenter.x,
+                startGroundHit.point.y + landingCircleOffset,
+                predictedCenter.z);
+        }
+
+        return true;
+    }
+
+    private bool TryGetGroundHit(Ray ray, float distance, out RaycastHit hit)
+    {
+        // Best option: assign the exact field collider in the Inspector.
+        // This avoids allocations and prevents accidentally hitting the ball.
+        if (groundCollider != null)
+            return groundCollider.Raycast(ray, out hit, distance);
+
+        // Allocation-free fallback for scenes where Ground Collider is not assigned.
+        int hitCount = Physics.RaycastNonAlloc(
+            ray,
+            groundHitBuffer,
+            distance,
+            groundLayer,
+            QueryTriggerInteraction.Ignore);
+
+        float nearestDistance = float.PositiveInfinity;
+        int nearestIndex = -1;
+
+        for (int i = 0; i < hitCount; i++)
+        {
+            Transform hitTransform = groundHitBuffer[i].transform;
+
+            // Ignore the football and its child colliders.
+            if (hitTransform == transform || hitTransform.IsChildOf(transform))
+                continue;
+
+            if (groundHitBuffer[i].distance < nearestDistance)
+            {
+                nearestDistance = groundHitBuffer[i].distance;
+                nearestIndex = i;
+            }
+        }
+
+        if (nearestIndex >= 0)
+        {
+            hit = groundHitBuffer[nearestIndex];
+            return true;
+        }
+
+        hit = default;
+        return false;
+    }
+
+    private float GetApproximateBallRadius()
+    {
+        SphereCollider sphere = GetComponent<SphereCollider>();
+        if (sphere != null)
+        {
+            Vector3 scale = sphere.transform.lossyScale;
+            return sphere.radius * Mathf.Max(
+                Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z));
+        }
+
+        Collider col = GetComponent<Collider>();
+        return col != null ? col.bounds.extents.y : 0.1f;
+    }
+
+    private void DrawTrajectory(Vector3 velocity, Vector3 landingPoint, float landingTime)
     {
         if (trajectoryLine == null)
             return;
 
-        if (velocity.sqrMagnitude < 0.001f)
-        {
-            trajectoryLine.positionCount = 0;
-            return;
-        }
+        float duration = Mathf.Clamp(landingTime, 0.01f, maxFlightTime);
+        int count = Mathf.Clamp(trajectoryPoints, 2, 150);
 
-        float step = Mathf.Max(0.005f, trajectoryTimeStep);
-        int count = Mathf.Clamp(trajectoryPoints, 2, 100);
-
-        // Draw over the predicted flight duration, capped for safety.
-        float duration = Mathf.Clamp(calculatedFlightTime, step, maxFlightTime);
-        int points = Mathf.Clamp(Mathf.CeilToInt(duration / step) + 1, 2, count);
-
+        // Evenly distribute points across the whole flight so the final point
+        // always reaches the predicted landing X/Z instead of stopping early.
+        int points = count;
         trajectoryLine.positionCount = points;
+        trajectoryLine.enabled = true;
+        trajectoryLine.useWorldSpace = true;
+        trajectoryLine.numCornerVertices = 2;
+        trajectoryLine.numCapVertices = 2;
+
         Vector3 start = ballRb.position;
         Vector3 gravity = Physics.gravity;
+        float ballRadius = GetApproximateBallRadius();
 
         for (int i = 0; i < points; i++)
         {
-            float time = Mathf.Min(i * step, duration);
-            Vector3 point = start + velocity * time + 0.5f * gravity * time * time;
+            float normalizedTime = i / (float)(points - 1);
+            float time = normalizedTime * duration;
+
+            Vector3 point = start
+                + velocity * time
+                + 0.5f * gravity * time * time;
+
+            // The last arc point is the ball centre at contact height, directly
+            // above the centre of the ground landing ring.
+            if (i == points - 1)
+                point = new Vector3(landingPoint.x, landingPoint.y + ballRadius, landingPoint.z);
+
             trajectoryLine.SetPosition(i, point);
+        }
+    }
+
+    private void DrawLandingCircle(Vector3 center, Vector3 normal)
+    {
+        if (landingCircle == null)
+            return;
+
+        int segments = Mathf.Clamp(landingCircleSegments, 16, 128);
+        landingCircle.positionCount = segments;
+        landingCircle.loop = true;
+        landingCircle.useWorldSpace = true;
+        landingCircle.widthMultiplier = landingCircleWidth;
+        landingCircle.numCornerVertices = 2;
+        landingCircle.numCapVertices = 2;
+
+        // Build a circle in the ground plane, so it lies flat on the field.
+        Vector3 axisA = Vector3.Cross(normal, Vector3.forward);
+        if (axisA.sqrMagnitude < 0.001f)
+            axisA = Vector3.Cross(normal, Vector3.right);
+
+        axisA.Normalize();
+        Vector3 axisB = Vector3.Cross(normal, axisA).normalized;
+
+        for (int i = 0; i < segments; i++)
+        {
+            float angle = (i / (float)segments) * Mathf.PI * 2f;
+            Vector3 point = center +
+                axisA * (Mathf.Cos(angle) * landingCircleRadius) +
+                axisB * (Mathf.Sin(angle) * landingCircleRadius);
+
+            landingCircle.SetPosition(i, point);
+        }
+
+        landingCircle.enabled = true;
+    }
+
+    private void HideLandingCircle()
+    {
+        if (landingCircle == null)
+            return;
+
+        landingCircle.positionCount = 0;
+        landingCircle.enabled = false;
+    }
+
+    private void DrawTrajectory(Vector3 velocity)
+    {
+        // Kept as a safe fallback for any existing internal call.
+        if (TryCalculateLanding(velocity, out Vector3 point, out float time,
+                out Vector3 normal))
+        {
+            DrawTrajectory(velocity, point, time);
+            DrawLandingCircle(point, normal);
         }
     }
 
@@ -371,11 +647,35 @@ public class SwipeFootballShooter : MonoBehaviour,
 
     private void OnCollisionEnter(Collision collision)
     {
+        Debug.Log("BALL HIT OBJECT: " + collision.collider.name);
+
+        // Search the collider itself and its parents.
+        MoleHole moleHole =
+            collision.collider.GetComponentInParent<MoleHole>();
+
+        if (moleHole != null)
+        {
+            Debug.Log("MOLE FOUND: " + moleHole.name);
+
+            Debug.Log("MOLE VISIBLE: " + moleHole.IsVisible);
+
+            bool result = moleHole.TryHit();
+
+            Debug.Log("MOLE HIT RESULT: " + result);
+
+            return;
+        }
+
+        Debug.Log("COLLISION WAS NOT A MOLE");
+
         if (!hasShot || isRespawning || !respawnOnGroundCollision)
             return;
 
-        if (!string.IsNullOrEmpty(groundTag) && collision.collider.CompareTag(groundTag))
+        if (!string.IsNullOrEmpty(groundTag) &&
+            collision.collider.CompareTag(groundTag))
+        {
             BeginRespawn();
+        }
     }
 
     private void LateUpdate()
@@ -450,6 +750,7 @@ public class SwipeFootballShooter : MonoBehaviour,
         smoothedLaunchVelocity = Vector3.zero;
         previewVelocity = Vector3.zero;
         currentSwipeSpeed = 0f;
+        peakSwipeSpeed = 0f;
         calculatedFlightTime = 0f;
         aimPoint = spawnPosition;
         HideTrajectory();
@@ -457,11 +758,22 @@ public class SwipeFootballShooter : MonoBehaviour,
 
     private void HideTrajectory()
     {
-        if (trajectoryLine == null)
-            return;
+        if (trajectoryLine != null)
+        {
+            trajectoryLine.positionCount = 0;
+            trajectoryLine.enabled = false;
+        }
 
-        trajectoryLine.positionCount = 0;
-        trajectoryLine.enabled = false;
+        HideLandingCircle();
+    }
+
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (hasFocus)
+        {
+            Application.targetFrameRate = targetFrameRate;
+            QualitySettings.vSyncCount = 0;
+        }
     }
 
     private void OnDisable()
